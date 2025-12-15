@@ -1,0 +1,64 @@
+name: DevSecOps Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  actions: read
+  contents: read
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install semgrep reportlab
+        
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: python,javascript
+        queries: security-extended,security-and-quality
+        
+    - name: Generate AI code sample
+      run: |
+        python cli/security_tool.py generate -d "API endpoint with authentication" -l python
+        
+    - name: Run Semgrep
+      run: |
+        semgrep --config auto --json --output analyses/semgrep_results.json . || true
+        
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      
+    - name: Export PDF report
+      run: |
+        if [ -f analyses/report_*.json ]; then
+          python cli/security_tool.py export-pdf $(ls analyses/report_*.json | head -1) || true
+        fi
+        
+    - name: Upload analysis artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-analysis-results
+        path: |
+          analyses/
+        retention-days: 30
