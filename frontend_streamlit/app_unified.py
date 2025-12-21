@@ -2,12 +2,15 @@ import streamlit as st
 import requests
 import json
 import pandas as pd
+import os
+import hashlib
 from pathlib import Path
 from typing import Optional, Dict, List
 import io
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-# Imports optionnels pour matplotlib
+# Optional matplotlib imports
 try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
@@ -26,6 +29,7 @@ st.set_page_config(
 st.sidebar.title("⚙️ Configuration")
 API_BASE_URL = st.sidebar.text_input("URL de l'API", value="http://localhost:8000")
 API_KEY = st.sidebar.text_input("API Key (optionnel)", type="password")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Vérifier le statut de l'API
 @st.cache_data(ttl=60)
@@ -67,12 +71,351 @@ def calculate_metrics(scanners_data: dict) -> tuple:
         if isinstance(detector_data, dict):
             patterns = detector_data.get("patterns", {})
             med_count += sum(1 for v in patterns.values() if v > 0)
+            issues = detector_data.get("issues", [])
+            if isinstance(issues, list):
+                med_count += len(issues)
     
     risk_score = high_count * 5 + med_count * 2 + low_count * 1
     
     return high_count, med_count, low_count, risk_score
 
-def display_results(result: dict, analysis_type: str, code_input: str = ""):
+
+def _convert_cli_scans(scans: dict) -> dict:
+    converted = {}
+
+    bandit = scans.get("bandit")
+    if isinstance(bandit, dict):
+        issues = []
+        for issue in bandit.get("results", []):
+            issues.append({
+                "severity": (issue.get("issue_severity") or "").upper(),
+                "text": issue.get("issue_text", ""),
+                "test_id": issue.get("test_id", ""),
+                "line": issue.get("line_number", ""),
+            })
+        converted["bandit"] = {"issues": issues}
+
+    semgrep = scans.get("semgrep")
+    if isinstance(semgrep, dict):
+        issues = []
+        for result in semgrep.get("results", []):
+            extra = result.get("extra", {}) if isinstance(result, dict) else {}
+            issues.append({
+                "severity": (extra.get("severity") or "").upper(),
+                "message": extra.get("message", ""),
+                "check_id": result.get("check_id", "") if isinstance(result, dict) else "",
+                "start": result.get("start", {}) if isinstance(result, dict) else {},
+            })
+        converted["semgrep"] = {"issues": issues}
+
+    snyk = scans.get("snyk")
+    if isinstance(snyk, dict):
+        issues = snyk.get("issues", [])
+        converted["snyk"] = {"issues": issues}
+
+    return converted
+
+def extract_scanners_data(report_data: dict) -> dict:
+    if not isinstance(report_data, dict):
+        return {}
+    scanners = report_data.get("scanners")
+    if isinstance(scanners, dict):
+        return scanners
+    analysis = report_data.get("analysis")
+    if isinstance(analysis, dict) and isinstance(analysis.get("scanners"), dict):
+        return analysis["scanners"]
+    scans = report_data.get("scans")
+    if isinstance(scans, dict):
+        return _convert_cli_scans(scans)
+    return {}
+
+def _normalize_scanners(scanners: Optional[List[str]]) -> List[str]:
+    if not scanners:
+        return []
+    normalized = {s.strip().lower() for s in scanners if isinstance(s, str) and s.strip()}
+    return sorted(normalized)
+
+
+def _request_hash(payload: dict) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _get_reports_dir() -> Optional[Path]:
+    reports_env = os.environ.get("REPORTS_DIR", "analyses")
+    reports_dir = Path(reports_env)
+    if not reports_dir.is_absolute():
+        reports_dir = REPO_ROOT / reports_dir
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        return reports_dir
+    except Exception:
+        return None
+
+
+def _iter_report_entries() -> List[Dict[str, object]]:
+    reports_dir = _get_reports_dir()
+    if not reports_dir or not reports_dir.exists():
+        return []
+
+    entries: List[Dict[str, object]] = []
+    report_files = sorted(reports_dir.glob("report_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for report_path in report_files:
+        try:
+            with report_path.open("r", encoding="utf-8") as handle:
+                report_data = json.load(handle)
+        except Exception:
+            continue
+        entries.append({"path": report_path, "data": report_data})
+    return entries
+
+
+def _get_report_request_hash(report_data: dict) -> Optional[str]:
+    if not isinstance(report_data, dict):
+        return None
+
+    metadata = report_data.get("metadata", {})
+    if isinstance(metadata, dict):
+        request_hash = metadata.get("request_hash")
+        if isinstance(request_hash, str) and request_hash:
+            return request_hash
+        request_meta = metadata.get("request")
+        if isinstance(request_meta, dict):
+            return _request_hash(request_meta)
+
+    request_hash = report_data.get("request_hash")
+    if isinstance(request_hash, str) and request_hash:
+        return request_hash
+
+    request_meta = report_data.get("request")
+    if isinstance(request_meta, dict):
+        return _request_hash(request_meta)
+
+    return None
+
+
+def _normalize_github_url(raw_url: str) -> str:
+    trimmed = (raw_url or "").strip()
+    if not trimmed:
+        return ""
+
+    parsed = urlparse(trimmed)
+    if not parsed.netloc:
+        parsed = urlparse(f"https://{trimmed}")
+
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return trimmed
+
+    owner = parts[0]
+    repo = parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    branch = None
+    if len(parts) >= 4 and parts[2] == "tree":
+        branch = parts[3]
+
+    base = f"https://github.com/{owner}/{repo}"
+    if branch:
+        return f"{base}/tree/{branch}"
+    return base
+
+
+def _repo_id_to_url(repo_id: str) -> str:
+    if not repo_id:
+        return ""
+    raw = str(repo_id)
+    base, _, branch = raw.partition("@")
+    if "/" not in base:
+        return ""
+    url = f"https://github.com/{base}"
+    if branch:
+        url = f"{url}/tree/{branch}"
+    return url
+
+
+def _find_duplicate_report(report_entries: List[Dict[str, object]], request_meta: dict, report_type: Optional[str] = None) -> Optional[Dict[str, object]]:
+    request_hash = _request_hash(request_meta)
+    for entry in report_entries:
+        report_data = entry.get("data", {})
+        if report_type:
+            if _infer_report_type(report_data, entry["path"].name) != report_type:
+                continue
+        if _get_report_request_hash(report_data) == request_hash:
+            return entry
+    return None
+
+
+def _find_duplicate_github_report(report_entries: List[Dict[str, object]], normalized_url: str, scanners: List[str]) -> Optional[Dict[str, object]]:
+    request_meta = {
+        "type": "github",
+        "url": normalized_url,
+        "scanners": scanners,
+    }
+    match = _find_duplicate_report(report_entries, request_meta, report_type="github")
+    if match:
+        return match
+
+    if not normalized_url:
+        return None
+
+    for entry in report_entries:
+        report_data = entry.get("data", {})
+        if _infer_report_type(report_data, entry["path"].name) != "github":
+            continue
+        repo_url = _repo_id_to_url(report_data.get("repo", ""))
+        if repo_url and _normalize_github_url(repo_url) == normalized_url:
+            report_scanners = _normalize_scanners([k for k in extract_scanners_data(report_data).keys() if k != "_meta"])
+            if not scanners or report_scanners == scanners:
+                return entry
+    return None
+
+def build_findings_list(scanners_data: dict, severity_filter: Optional[List[str]] = None, scanner_filter: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """Build a unified list of findings for UI tables."""
+    severity_filter = severity_filter or ["HIGH", "MEDIUM", "LOW"]
+    scanner_filter = scanner_filter or ["bandit", "semgrep", "snyk", "gemini_detector"]
+    findings_list: List[Dict[str, str]] = []
+
+    # Bandit findings
+    if "bandit" in scanners_data and "bandit" in scanner_filter:
+        bandit_data = scanners_data["bandit"]
+        if isinstance(bandit_data, dict) and "issues" in bandit_data:
+            for issue in bandit_data["issues"]:
+                sev = issue.get("severity", "").upper()
+                if sev in severity_filter:
+                    findings_list.append({
+                        "Scanner": "Bandit",
+                        "Severite": sev,
+                        "Type": issue.get("test_id", ""),
+                        "Message": issue.get("text", "")[:100],
+                        "Ligne": issue.get("line", ""),
+                    })
+
+    # Semgrep findings
+    if "semgrep" in scanners_data and "semgrep" in scanner_filter:
+        semgrep_data = scanners_data["semgrep"]
+        if isinstance(semgrep_data, dict) and "issues" in semgrep_data:
+            for issue in semgrep_data["issues"]:
+                sev = issue.get("severity", "").upper()
+                if sev in severity_filter or (sev not in ["HIGH", "MEDIUM", "LOW"] and "MEDIUM" in severity_filter):
+                    findings_list.append({
+                        "Scanner": "Semgrep",
+                        "Severite": sev if sev in ["HIGH", "MEDIUM", "LOW"] else "MEDIUM",
+                        "Type": issue.get("check_id", ""),
+                        "Message": issue.get("message", "")[:100],
+                        "Ligne": issue.get("start", {}).get("line", "") if isinstance(issue.get("start"), dict) else "",
+                    })
+
+    # Snyk findings
+    if "snyk" in scanners_data and "snyk" in scanner_filter:
+        snyk_data = scanners_data["snyk"]
+        if isinstance(snyk_data, dict) and "issues" in snyk_data:
+            for issue in snyk_data["issues"]:
+                sev = issue.get("severity", "").upper()
+                if sev in severity_filter:
+                    findings_list.append({
+                        "Scanner": "Snyk",
+                        "Severite": sev,
+                        "Type": issue.get("id", ""),
+                        "Message": issue.get("title", "")[:100],
+                        "Ligne": "",
+                    })
+
+    # Detector findings (issues or patterns)
+    if ("gemini_detector" in scanners_data or "gemini_detector_snippet" in scanners_data) and "gemini_detector" in scanner_filter:
+        detector_data = scanners_data.get("gemini_detector_snippet") or scanners_data.get("gemini_detector", {})
+        if isinstance(detector_data, dict):
+            issues = detector_data.get("issues", [])
+            if isinstance(issues, list):
+                for issue in issues:
+                    if "MEDIUM" in severity_filter:
+                        msg = issue.get("pattern") or issue.get("name") or issue.get("attr") or issue.get("call") or ""
+                        findings_list.append({
+                            "Scanner": "Detector",
+                            "Severite": "MEDIUM",
+                            "Type": issue.get("type", ""),
+                            "Message": msg,
+                            "Ligne": issue.get("lineno", ""),
+                        })
+            patterns = detector_data.get("patterns", {})
+            if isinstance(patterns, dict):
+                for pattern_name, count in patterns.items():
+                    if count > 0 and "MEDIUM" in severity_filter:
+                        findings_list.append({
+                            "Scanner": "Detector",
+                            "Severite": "MEDIUM",
+                            "Type": pattern_name,
+                            "Message": f"Pattern detecte {count} fois",
+                            "Ligne": "",
+                        })
+
+    return findings_list
+
+
+def _parse_report_datetime(report_data: dict, report_path: Path) -> datetime:
+    candidates = []
+    metadata = report_data.get("metadata", {})
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get("timestamp"))
+    generation = report_data.get("generation")
+    if isinstance(generation, dict):
+        candidates.append(generation.get("timestamp"))
+    candidates.append(report_data.get("generated_at"))
+
+    for ts in candidates:
+        if isinstance(ts, str) and ts:
+            val = ts.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(val)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
+            except ValueError:
+                continue
+
+    try:
+        file_ts = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc)
+        return file_ts
+    except Exception:
+        return datetime.utcnow().replace(tzinfo=timezone.utc)
+
+
+def _infer_report_type(report_data: dict, report_name: str) -> str:
+    if isinstance(report_data.get("generation"), dict):
+        return "generation"
+
+    metadata = report_data.get("metadata", {})
+    if isinstance(metadata, dict):
+        raw_type = str(metadata.get("type", "")).lower()
+        if "repo" in raw_type:
+            return "github"
+        if "snippet" in raw_type or "code" in raw_type:
+            return "code"
+
+    if report_data.get("repo"):
+        return "github"
+    if report_name.startswith("report_repo"):
+        return "github"
+    if report_name.startswith("report_snippet"):
+        return "code"
+    if isinstance(report_data.get("analysis"), dict):
+        return "code"
+
+    return "unknown"
+
+
+def _severity_bucket(high_count: int, med_count: int, low_count: int) -> str:
+    if high_count > 0:
+        return "HIGH"
+    if med_count > 0:
+        return "MEDIUM"
+    if low_count > 0:
+        return "LOW"
+    return "NONE"
+
+
+def display_results(result: dict, analysis_type: str, code_input: str = "", compact: bool = False):
     """Affiche les résultats d'analyse de manière formatée."""
     st.header("📊 Résultats de l'analyse")
     
@@ -97,6 +440,39 @@ def display_results(result: dict, analysis_type: str, code_input: str = ""):
         if "repo" in result:
             st.info(f"📦 Dépôt analysé: {result['repo']}")
     
+    if compact:
+        st.subheader("Resume rapide")
+        summary_rows = []
+
+        for scanner_name, scanner_data in scanners_data.items():
+            if scanner_name in ("_meta", "gemini_detector", "gemini_detector_snippet"):
+                continue
+            issues = scanner_data.get("issues", []) if isinstance(scanner_data, dict) else []
+            summary_rows.append({
+                "Scanner": scanner_name,
+                "Issues": len(issues),
+            })
+
+        detector_data = scanners_data.get("gemini_detector_snippet") or scanners_data.get("gemini_detector", {})
+        if isinstance(detector_data, dict):
+            patterns = detector_data.get("patterns", {})
+            issues = detector_data.get("issues", [])
+            total_patterns = 0
+            if patterns:
+                total_patterns = sum(int(v) for v in patterns.values())
+            total_issues = len(issues) if isinstance(issues, list) else 0
+            if total_patterns + total_issues > 0:
+                summary_rows.append({
+                    "Scanner": "Detector",
+                    "Issues": total_patterns + total_issues,
+                })
+
+        if summary_rows:
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+        else:
+            st.info("Aucun resultat a afficher")
+        return
+
     # Filtres
     st.subheader("🔍 Findings")
     
@@ -117,68 +493,9 @@ def display_results(result: dict, analysis_type: str, code_input: str = ""):
         )
     
     # Table des findings
-    findings_list = []
-    
-    # Bandit findings
-    if "bandit" in scanners_data and "bandit" in scanner_filter:
-        bandit_data = scanners_data["bandit"]
-        if isinstance(bandit_data, dict) and "issues" in bandit_data:
-            for issue in bandit_data["issues"]:
-                sev = issue.get("severity", "").upper()
-                if sev in severity_filter:
-                    findings_list.append({
-                        "Scanner": "Bandit",
-                        "Sévérité": sev,
-                        "Type": issue.get("test_id", ""),
-                        "Message": issue.get("text", "")[:100],
-                        "Ligne": issue.get("line", ""),
-                    })
-    
-    # Semgrep findings
-    if "semgrep" in scanners_data and "semgrep" in scanner_filter:
-        semgrep_data = scanners_data["semgrep"]
-        if isinstance(semgrep_data, dict) and "issues" in semgrep_data:
-            for issue in semgrep_data["issues"]:
-                sev = issue.get("severity", "").upper()
-                if sev in severity_filter or (sev not in ["HIGH", "MEDIUM", "LOW"] and "MEDIUM" in severity_filter):
-                    findings_list.append({
-                        "Scanner": "Semgrep",
-                        "Sévérité": sev if sev in ["HIGH", "MEDIUM", "LOW"] else "MEDIUM",
-                        "Type": issue.get("check_id", ""),
-                        "Message": issue.get("message", "")[:100],
-                        "Ligne": issue.get("start", {}).get("line", "") if isinstance(issue.get("start"), dict) else "",
-                    })
-    
-    # Snyk findings
-    if "snyk" in scanners_data and "snyk" in scanner_filter:
-        snyk_data = scanners_data["snyk"]
-        if isinstance(snyk_data, dict) and "issues" in snyk_data:
-            for issue in snyk_data["issues"]:
-                sev = issue.get("severity", "").upper()
-                if sev in severity_filter:
-                    findings_list.append({
-                        "Scanner": "Snyk",
-                        "Sévérité": sev,
-                        "Type": issue.get("id", ""),
-                        "Message": issue.get("title", "")[:100],
-                        "Ligne": "",
-                    })
-    
-    # Detector findings
-    if ("gemini_detector" in scanners_data or "gemini_detector_snippet" in scanners_data) and "gemini_detector" in scanner_filter:
-        detector_data = scanners_data.get("gemini_detector_snippet") or scanners_data.get("gemini_detector", {})
-        if isinstance(detector_data, dict) and "patterns" in detector_data:
-            patterns = detector_data["patterns"]
-            for pattern_name, count in patterns.items():
-                if count > 0 and "MEDIUM" in severity_filter:
-                    findings_list.append({
-                        "Scanner": "Detector",
-                        "Sévérité": "MEDIUM",
-                        "Type": pattern_name,
-                        "Message": f"Pattern détecté {count} fois",
-                        "Ligne": "",
-                    })
-    
+    findings_list = build_findings_list(scanners_data, severity_filter, scanner_filter)
+
+
     if findings_list:
         df = pd.DataFrame(findings_list)
         st.dataframe(df, use_container_width=True, height=400)
@@ -265,19 +582,69 @@ def display_results(result: dict, analysis_type: str, code_input: str = ""):
             except Exception as e:
                 st.error(f"Erreur: {str(e)}")
 
+def display_generation_result(result: dict):
+    generation = result.get("generation", {}) if isinstance(result, dict) else {}
+    analysis = result.get("analysis", {}) if isinstance(result, dict) else {}
+
+    provider = generation.get("provider", "N/A")
+    model = generation.get("model", "N/A")
+    st.success(f"Code genere avec succes ({provider} - {model})")
+
+    col_tokens, col_cost, col_time = st.columns(3)
+    with col_tokens:
+        st.metric("Tokens utilises", generation.get("tokens_used", 0))
+    with col_cost:
+        cost = generation.get("cost_usd", 0) or 0
+        st.metric("Cout estime", f"${cost:.4f}" if cost else "Gratuit")
+    with col_time:
+        duration = generation.get("metadata", {}).get("duration_seconds", 0)
+        st.metric("Duree", f"{duration:.2f}s" if duration else "N/A")
+
+    st.subheader("Code genere")
+    display_language = analysis.get("language") or "python"
+    st.code(generation.get("code", ""), language=display_language)
+
+    st.subheader("Resultats de l'analyse de securite")
+    scanners_data = analysis.get("scanners", {})
+    high_count, med_count, low_count, risk_score = calculate_metrics(scanners_data)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("HIGH", high_count)
+    with col2:
+        st.metric("MEDIUM", med_count)
+    with col3:
+        st.metric("LOW", low_count)
+    with col4:
+        st.metric("Risk Score", risk_score)
+
+    for scanner_name, scanner_result in scanners_data.items():
+        if isinstance(scanner_result, dict) and scanner_result.get("success"):
+            with st.expander(f"Resultats {scanner_name.upper()}", expanded=False):
+                issues = scanner_result.get("issues", [])
+                if issues:
+                    st.write(f"**{len(issues)} issue(s) detectee(s)**")
+                    for issue in issues[:10]:
+                        severity = issue.get("severity", "UNKNOWN")
+                        message = issue.get("message", issue.get("title", "N/A"))
+                        st.write(f"- [{severity}] {message}")
+                else:
+                    st.success("Aucune issue detectee")
+
 api_status = check_api_status()
 if api_status:
     st.sidebar.success("✅ API connectée")
 else:
     st.sidebar.error("❌ API non accessible")
 
-# Options scanners globales
-st.sidebar.markdown("### Options de scan par défaut")
+# Options scanners globales (utilisées dans tous les onglets)
+st.sidebar.markdown("### 🔧 Options de scan (Globales)")
+st.sidebar.markdown("*Ces options s'appliquent à tous les onglets*")
 default_scanners = {
     "bandit": st.sidebar.checkbox("Bandit", value=True, key="default_bandit"),
     "semgrep": st.sidebar.checkbox("Semgrep", value=False, key="default_semgrep"),
     "snyk": st.sidebar.checkbox("Snyk", value=False, key="default_snyk"),
-    "gemini_detector": st.sidebar.checkbox("Gemini Detector", value=True, key="default_detector"),
+    "gemini_detector": st.sidebar.checkbox("Détecteur Gemini", value=True, key="default_detector"),
 }
 
 # Thème personnalisé
@@ -362,20 +729,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Onglets principaux
-tab_gen, tab_code, tab_github, tab_compare, tab_dash, tab_hist, tab_help = st.tabs([
-    "🤖 Génération IA",
-    "📝 Analyse de Code",
-    "🐙 Analyse GitHub",
-    "📊 Comparaison Providers",
-    "📈 Dashboard",
-    "📚 Historique",
-    "⚙️ Aide"
-])
+nav_items = [
+    ("gen", "Generation IA"),
+    ("code", "Analyse de Code"),
+    ("github", "Analyse GitHub"),
+    ("dash", "Dashboard"),
+    ("hist", "Historique"),
+    ("help", "Aide"),
+]
+nav_labels = [label for _, label in nav_items]
+nav_key_by_label = {label: key for key, label in nav_items}
+
+active_label = st.radio(
+    "Navigation",
+    nav_labels,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_nav",
+)
+active_tab = nav_key_by_label.get(active_label, "gen")
 
 # ============================================
+
 # TAB 1: GÉNÉRATION IA
 # ============================================
-with tab_gen:
+if active_tab == "gen":
     st.header("🤖 Générer du Code avec IA et Analyser")
     
     # Vérifier les providers disponibles
@@ -391,12 +769,12 @@ with tab_gen:
                 if providers_data.get("openai_configured"):
                     st.success("✅ OpenAI configuré")
                 else:
-                    st.warning("⚠️ OpenAI non configuré (set OPENAI_API_KEY)")
+                    st.info("ℹ️ OpenAI non configuré (optionnel)")
             with col_anthropic:
                 if providers_data.get("anthropic_configured"):
                     st.success("✅ Anthropic configuré")
                 else:
-                    st.warning("⚠️ Anthropic non configuré (set ANTHROPIC_API_KEY)")
+                    st.info("ℹ️ Anthropic non configuré (optionnel)")
         else:
             available_providers = ["simulate"]
             st.warning("Impossible de vérifier les providers, utilisation de 'simulate' par défaut")
@@ -448,133 +826,88 @@ with tab_gen:
             key="gen_max_tokens"
         )
     
-    # Sélection des scanners
-    st.subheader("Scanners à exécuter")
-    scanners_options = ["bandit", "semgrep", "snyk", "gemini_detector"]
-    selected_scanners = st.multiselect(
-        "Choisissez les scanners",
-        scanners_options,
-        default=["bandit", "semgrep", "gemini_detector"] if language == "python" else ["semgrep", "gemini_detector"],
-        key="gen_scanners"
-    )
+    # Utiliser les scanners globaux de la sidebar
+    selected_scanners = [name for name, enabled in default_scanners.items() if enabled]
+    normalized_scanners = _normalize_scanners(selected_scanners)
     
     # Bouton de génération
     if st.button("🚀 Générer et Analyser", type="primary", use_container_width=True, key="gen_analyze_btn"):
         if not description:
             st.error("Veuillez saisir une description du code à générer")
         else:
-            with st.spinner(f"Génération avec {provider}... ⏳"):
-                try:
-                    headers = {}
-                    if API_KEY:
-                        headers["X-API-KEY"] = API_KEY
+            report_entries = _iter_report_entries()
+            request_meta = {
+                "type": "generation",
+                "description": description,
+                "language": language,
+                "provider": provider,
+                "model": None,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "scanners": normalized_scanners,
+            }
+            duplicate = _find_duplicate_report(report_entries, request_meta, report_type="generation")
+            if duplicate:
+                st.session_state["last_generation_result"] = duplicate["data"]
+                st.session_state["last_generation_duplicate"] = True
+            else:
+                with st.spinner(f"Génération avec {provider}... ⏳"):
+                    try:
+                        headers = {}
+                        if API_KEY:
+                            headers["X-API-KEY"] = API_KEY
+                        
+                        payload = {
+                            "description": description,
+                            "language": language,
+                            "provider": provider,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                            "scanners": selected_scanners,
+                        }
+                        
+                        response = requests.post(
+                            f"{API_BASE_URL}/generate-and-analyze",
+                            json=payload,
+                            headers=headers,
+                            timeout=60
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            st.session_state["last_generation_result"] = result
+                            st.session_state["last_generation_duplicate"] = False
+                        elif response.status_code == 429:
+                            st.error("Rate limit dépassé. Attendez quelques secondes.")
+                        else:
+                            st.error(f"Erreur API : {response.status_code} - {response.text}")
                     
-                    payload = {
-                        "description": description,
-                        "language": language,
-                        "provider": provider,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "scanners": selected_scanners,
-                    }
-                    
-                    response = requests.post(
-                        f"{API_BASE_URL}/generate-and-analyze",
-                        json=payload,
-                        headers=headers,
-                        timeout=60
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        generation = result.get("generation", {})
-                        analysis = result.get("analysis", {})
-                        
-                        # Afficher le code généré
-                        st.success(f"✅ Code généré avec succès ({generation.get('provider')} - {generation.get('model')})")
-                        
-                        # Métadonnées de génération
-                        col_tokens, col_cost, col_time = st.columns(3)
-                        with col_tokens:
-                            st.metric("Tokens utilisés", generation.get("tokens_used", 0))
-                        with col_cost:
-                            cost = generation.get("cost_usd", 0)
-                            st.metric("Coût estimé", f"${cost:.4f}" if cost else "Gratuit")
-                        with col_time:
-                            duration = generation.get("metadata", {}).get("duration_seconds", 0)
-                            st.metric("Durée", f"{duration:.2f}s" if duration else "N/A")
-                        
-                        # Code généré
-                        st.subheader("📄 Code généré")
-                        st.code(generation.get("code", ""), language=language)
-                        
-                        # Résultats de l'analyse
-                        st.subheader("🔍 Résultats de l'analyse de sécurité")
-                        scanners_data = analysis.get("scanners", {})
-                        
-                        # Calculer les métriques
-                        high_count, med_count, low_count, risk_score = calculate_metrics(scanners_data)
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("HIGH", high_count)
-                        with col2:
-                            st.metric("MEDIUM", med_count)
-                        with col3:
-                            st.metric("LOW", low_count)
-                        with col4:
-                            st.metric("Risk Score", risk_score)
-                        
-                        # Détails des scanners
-                        for scanner_name, scanner_result in scanners_data.items():
-                            if isinstance(scanner_result, dict) and scanner_result.get("success"):
-                                with st.expander(f"🔎 {scanner_name.upper()}", expanded=False):
-                                    issues = scanner_result.get("issues", [])
-                                    if issues:
-                                        st.write(f"**{len(issues)} issue(s) détecté(s)**")
-                                        for issue in issues[:10]:  # Limite 10
-                                            severity = issue.get("severity", "UNKNOWN")
-                                            message = issue.get("message", issue.get("title", "N/A"))
-                                            st.write(f"- [{severity}] {message}")
-                                    else:
-                                        st.success("Aucune issue détectée")
-                    
-                    elif response.status_code == 429:
-                        st.error("⚠️ Rate limit dépassé. Attendez quelques secondes.")
-                    else:
-                        st.error(f"Erreur API : {response.status_code} - {response.text}")
-                
-                except requests.exceptions.Timeout:
-                    st.error("⏱️ Timeout : la génération a pris trop de temps (>60s)")
-                except Exception as e:
-                    st.error(f"❌ Erreur : {e}")
+                    except requests.exceptions.Timeout:
+                        st.error("Timeout : la génération a pris trop de temps (>60s)")
+                    except Exception as e:
+                        st.error(f"Erreur : {e}")
+
+    if "last_generation_result" in st.session_state:
+        if st.session_state.get("last_generation_duplicate"):
+            st.info("Analyse deja effectuee. Rapport charge depuis l'historique.")
+        display_generation_result(st.session_state["last_generation_result"])
 
 # ============================================
 # TAB 2: ANALYSE DE CODE
 # ============================================
-with tab_code:
+if active_tab == "code":
     st.header("🔒 Analyse de Code en Temps Réel")
     st.markdown("Analysez votre code pour détecter les vulnérabilités de sécurité")
     
-    col_lang, col_scan = st.columns([1, 2])
+    language = st.selectbox(
+        "Langage",
+        ["python", "javascript", "typescript", "java", "csharp"],
+        index=0
+    )
     
-    with col_lang:
-        language = st.selectbox(
-            "Langage",
-            ["python", "javascript", "typescript", "java", "csharp"],
-            index=0
-        )
-    
-    with col_scan:
-        st.markdown("### Scanners")
-        scanners = {
-            "bandit": st.checkbox("Bandit", value=default_scanners["bandit"], key="code_bandit"),
-            "semgrep": st.checkbox("Semgrep", value=default_scanners["semgrep"], key="code_semgrep"),
-            "snyk": st.checkbox("Snyk", value=default_scanners["snyk"], key="code_snyk"),
-            "gemini_detector": st.checkbox("Gemini Detector", value=default_scanners["gemini_detector"], key="code_detector"),
-        }
-    
-    selected_scanners = [name for name, enabled in scanners.items() if enabled]
+    # Utiliser les scanners globaux de la sidebar
+    selected_scanners = [name for name, enabled in default_scanners.items() if enabled]
+    normalized_scanners = _normalize_scanners(selected_scanners)
     
     # Zone de code
     code_input = st.text_area(
@@ -600,35 +933,51 @@ def login(username, password):
         if not code_input.strip():
             st.error("Veuillez entrer du code à analyser")
         else:
-            with st.spinner("Analyse en cours..."):
-                try:
-                    headers = {"Content-Type": "application/json"}
-                    if API_KEY:
-                        headers["X-API-KEY"] = API_KEY
-                    
-                    body = {
-                        "language": language,
-                        "code": code_input,
-                        "scanners": selected_scanners if selected_scanners else None,
-                    }
-                    
-                    response = requests.post(
-                        f"{API_BASE_URL}/analyze",
-                        json=body,
-                        headers=headers,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.session_state["last_code_result"] = result
-                        st.session_state["last_analysis_type"] = "code"
-                        st.success("✅ Analyse terminée!")
-                    else:
-                        st.error(f"❌ Erreur API: {response.status_code} - {response.text}")
-                except Exception as e:
-                    st.error(f"❌ Erreur: {str(e)}")
-    
+            report_entries = _iter_report_entries()
+            request_meta = {
+                "type": "code",
+                "mode": "full",
+                "language": language,
+                "scanners": normalized_scanners,
+                "code_sha256": hashlib.sha256(code_input.encode("utf-8")).hexdigest(),
+                "code_len": len(code_input),
+            }
+            duplicate = _find_duplicate_report(report_entries, request_meta, report_type="code")
+            if duplicate:
+                st.session_state["last_code_result"] = duplicate["data"]
+                st.session_state["last_analysis_type"] = "code"
+                st.session_state["last_code_duplicate"] = True
+            else:
+                with st.spinner("Analyse en cours..."):
+                    try:
+                        headers = {"Content-Type": "application/json"}
+                        if API_KEY:
+                            headers["X-API-KEY"] = API_KEY
+                        
+                        body = {
+                            "language": language,
+                            "code": code_input,
+                            "scanners": selected_scanners if selected_scanners else None,
+                        }
+                        
+                        response = requests.post(
+                            f"{API_BASE_URL}/analyze",
+                            json=body,
+                            headers=headers,
+                            timeout=30
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            st.session_state["last_code_result"] = result
+                            st.session_state["last_analysis_type"] = "code"
+                            st.session_state["last_code_duplicate"] = False
+                            st.success("✅ Analyse terminée!")
+                        else:
+                            st.error(f"❌ Erreur API: {response.status_code} - {response.text}")
+                    except Exception as e:
+                        st.error(f"❌ Erreur: {str(e)}")
+
     # Analyse rapide
     if analyze_fast_btn:
         if not code_input.strip():
@@ -636,42 +985,66 @@ def login(username, password):
         elif language != "python":
             st.warning("⚠️ L'analyse rapide est disponible uniquement pour Python")
         else:
-            with st.spinner("Analyse rapide en cours..."):
-                try:
-                    headers = {"Content-Type": "application/json"}
-                    if API_KEY:
-                        headers["X-API-KEY"] = API_KEY
-                    
-                    body = {
-                        "language": language,
-                        "code": code_input,
-                    }
-                    
-                    response = requests.post(
-                        f"{API_BASE_URL}/analyze-fast",
-                        json=body,
-                        headers=headers,
-                        timeout=15
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.session_state["last_code_result"] = result
-                        st.session_state["last_analysis_type"] = "code_fast"
-                        st.success("✅ Analyse rapide terminée!")
-                    else:
-                        st.error(f"❌ Erreur API: {response.status_code}")
-                except Exception as e:
-                    st.error(f"❌ Erreur: {str(e)}")
-    
+            report_entries = _iter_report_entries()
+            request_meta = {
+                "type": "code",
+                "mode": "fast",
+                "language": language,
+                "scanners": ["bandit", "gemini_detector"],
+                "code_sha256": hashlib.sha256(code_input.encode("utf-8")).hexdigest(),
+                "code_len": len(code_input),
+            }
+            duplicate = _find_duplicate_report(report_entries, request_meta, report_type="code")
+            if duplicate:
+                st.session_state["last_code_result"] = duplicate["data"]
+                st.session_state["last_analysis_type"] = "code_fast"
+                st.session_state["last_code_duplicate"] = True
+            else:
+                with st.spinner("Analyse rapide en cours..."):
+                    try:
+                        headers = {"Content-Type": "application/json"}
+                        if API_KEY:
+                            headers["X-API-KEY"] = API_KEY
+                        
+                        body = {
+                            "language": language,
+                            "code": code_input,
+                        }
+                        
+                        response = requests.post(
+                            f"{API_BASE_URL}/analyze-fast",
+                            json=body,
+                            headers=headers,
+                            timeout=15
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            st.session_state["last_code_result"] = result
+                            st.session_state["last_analysis_type"] = "code_fast"
+                            st.session_state["last_code_duplicate"] = False
+                            st.success("✅ Analyse rapide terminée!")
+                        else:
+                            st.error(f"❌ Erreur API: {response.status_code}")
+                    except Exception as e:
+                        st.error(f"❌ Erreur: {str(e)}")
+
     # Afficher les résultats de l'analyse de code
-    if "last_code_result" in st.session_state and st.session_state.get("last_analysis_type", "").startswith("code"):
-        display_results(st.session_state["last_code_result"], "code", code_input)
+    analysis_type = st.session_state.get("last_analysis_type", "code")
+    if "last_code_result" in st.session_state and analysis_type.startswith("code"):
+        if st.session_state.get("last_code_duplicate"):
+            st.info("Analyse deja effectuee. Rapport charge depuis l'historique.")
+        display_results(
+            st.session_state["last_code_result"],
+            analysis_type,
+            code_input,
+            compact=(analysis_type == "code_fast"),
+        )
 
 # ============================================
 # TAB 3: ANALYSE GITHUB
 # ============================================
-with tab_github:
+if active_tab == "github":
     st.header("🐙 Analyse de Dépôt GitHub")
     st.markdown("Analysez un dépôt GitHub complet pour détecter les vulnérabilités")
     
@@ -696,194 +1069,88 @@ with tab_github:
         else:
             st.info(f"📋 Dépôt à analyser: `{repo_url}`")
     
-    # Options de scan pour GitHub
-    st.subheader("Options de scan")
-    github_scanners = {
-        "bandit": st.checkbox("Bandit", value=default_scanners["bandit"], key="gh_bandit"),
-        "semgrep": st.checkbox("Semgrep", value=default_scanners["semgrep"], key="gh_semgrep"),
-        "snyk": st.checkbox("Snyk", value=default_scanners["snyk"], key="gh_snyk"),
-        "gemini_detector": st.checkbox("Gemini Detector", value=default_scanners["gemini_detector"], key="gh_detector"),
-    }
-    selected_github_scanners = [name for name, enabled in github_scanners.items() if enabled]
-    
-    # Token GitHub optionnel
-    github_token = st.text_input(
-        "Token GitHub (optionnel, pour dépôts privés)",
-        type="password",
-        help="Personal Access Token pour accéder aux dépôts privés"
-    )
+    # Utiliser les scanners globaux de la sidebar
+    selected_github_scanners = [name for name, enabled in default_scanners.items() if enabled]
+    normalized_github_scanners = _normalize_scanners(selected_github_scanners)
     
     if analyze_github_btn:
         if not repo_url.strip():
-            st.error("❌ Veuillez entrer une URL GitHub")
+            st.error("? Veuillez entrer une URL GitHub")
         else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            try:
-                status_text.text("🔄 Téléchargement du dépôt...")
-                progress_bar.progress(20)
+            normalized_url = _normalize_github_url(repo_url)
+            report_entries = _iter_report_entries()
+            duplicate = _find_duplicate_github_report(report_entries, normalized_url, normalized_github_scanners)
+            if duplicate:
+                st.session_state["last_github_result"] = duplicate["data"]
+                st.session_state["last_analysis_type"] = "github"
+                st.session_state["last_github_duplicate"] = True
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-                headers = {"Content-Type": "application/json"}
-                if API_KEY:
-                    headers["X-API-KEY"] = API_KEY
-                
-                body = {
-                    "url": repo_url.strip(),
-                    "scanners": selected_github_scanners if selected_github_scanners else None,
-                }
-                if github_token:
-                    body["token"] = github_token
-                
-                status_text.text("🔄 Analyse en cours... (cela peut prendre plusieurs minutes)")
-                progress_bar.progress(40)
-                
-                response = requests.post(
-                    f"{API_BASE_URL}/analyze-github",
-                    json=body,
-                    headers=headers,
-                    timeout=300  # 5 minutes pour les gros dépôts
-                )
-                
-                progress_bar.progress(80)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    st.session_state["last_github_result"] = result
-                    st.session_state["last_analysis_type"] = "github"
-                    progress_bar.progress(100)
-                    status_text.text("✅ Analyse terminée!")
-                    st.success(f"✅ Dépôt analysé: {result.get('repo', 'N/A')}")
-                else:
-                    progress_bar.empty()
-                    error_msg = f"Erreur {response.status_code}"
-                    try:
-                        error_data = response.json()
-                        error_msg += f": {error_data.get('detail', response.text)}"
-                    except:
-                        error_msg += f": {response.text}"
-                    st.error(f"❌ {error_msg}")
-                    status_text.empty()
+                try:
+                    status_text.text("?? T?l?chargement du d?p?t...")
+                    progress_bar.progress(20)
                     
-            except requests.exceptions.Timeout:
-                progress_bar.empty()
-                status_text.empty()
-                st.error("⏱️ Timeout: L'analyse prend trop de temps. Essayez avec moins de scanners.")
-            except Exception as e:
-                progress_bar.empty()
-                status_text.empty()
-                st.error(f"❌ Erreur: {str(e)}")
-    
+                    headers = {"Content-Type": "application/json"}
+                    if API_KEY:
+                        headers["X-API-KEY"] = API_KEY
+                    
+                    body = {
+                        "url": repo_url.strip(),
+                        "scanners": selected_github_scanners if selected_github_scanners else None,
+                    }
+                    
+                    status_text.text("?? Analyse en cours... (cela peut prendre plusieurs minutes)")
+                    progress_bar.progress(40)
+                    
+                    response = requests.post(
+                        f"{API_BASE_URL}/analyze-github",
+                        json=body,
+                        headers=headers,
+                        timeout=300  # 5 minutes pour les gros d?p?ts
+                    )
+                    
+                    progress_bar.progress(80)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        st.session_state["last_github_result"] = result
+                        st.session_state["last_analysis_type"] = "github"
+                        st.session_state["last_github_duplicate"] = False
+                        progress_bar.progress(100)
+                        status_text.text("? Analyse termin?e!")
+                        st.success(f"? D?p?t analys?: {result.get('repo', 'N/A')}")
+                    else:
+                        progress_bar.empty()
+                        error_msg = f"Erreur {response.status_code}"
+                        try:
+                            error_data = response.json()
+                            error_msg += f": {error_data.get('detail', response.text)}"
+                        except:
+                            error_msg += f": {response.text}"
+                        st.error(f"? {error_msg}")
+                        status_text.empty()
+                        
+                except requests.exceptions.Timeout:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error("?? Timeout: L'analyse prend trop de temps. Essayez avec moins de scanners.")
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"? Erreur: {str(e)}")
+
     # Afficher les résultats GitHub
     if "last_github_result" in st.session_state and st.session_state.get("last_analysis_type") == "github":
+        if st.session_state.get("last_github_duplicate"):
+            st.info("Analyse deja effectuee. Rapport charge depuis l'historique.")
         display_results(st.session_state["last_github_result"], "github", "")
 
 # ============================================
-# TAB 4: COMPARAISON PROVIDERS
-# ============================================
-with tab_compare:
-    st.header("📊 Comparaison des Providers IA")
-    st.info("Cette section permet de comparer la sécurité du code généré par différents providers")
-    
-    # Formulaire de comparaison
-    comparison_description = st.text_input(
-        "Description du code pour comparaison",
-        placeholder="Ex: User authentication system",
-        key="compare_desc"
-    )
-    
-    comparison_language = st.selectbox(
-        "Langage",
-        ["python", "javascript", "typescript", "java", "csharp"],
-        key="compare_lang"
-    )
-    
-    if st.button("🔄 Comparer les Providers", type="primary", key="compare_btn"):
-        if not comparison_description:
-            st.error("Veuillez saisir une description")
-        else:
-            # Récupérer les providers disponibles
-            try:
-                providers_resp = requests.get(f"{API_BASE_URL}/api/providers", timeout=5)
-                if providers_resp.status_code == 200:
-                    providers_data = providers_resp.json()
-                    available_providers = providers_data.get("available_providers", ["simulate"])
-                else:
-                    available_providers = ["simulate"]
-            except:
-                available_providers = ["simulate"]
-            
-            results = {}
-            
-            # Générer avec chaque provider disponible
-            for provider in available_providers:
-                with st.spinner(f"Génération avec {provider}..."):
-                    try:
-                        headers = {}
-                        if API_KEY:
-                            headers["X-API-KEY"] = API_KEY
-                        
-                        payload = {
-                            "description": comparison_description,
-                            "language": comparison_language,
-                            "provider": provider,
-                            "scanners": ["bandit", "semgrep", "gemini_detector"],
-                        }
-                        
-                        response = requests.post(
-                            f"{API_BASE_URL}/generate-and-analyze",
-                            json=payload,
-                            headers=headers,
-                            timeout=60
-                        )
-                        
-                        if response.status_code == 200:
-                            results[provider] = response.json()
-                    except Exception as e:
-                        st.warning(f"Échec {provider}: {e}")
-            
-            # Afficher la comparaison
-            if results:
-                st.success(f"✅ Comparaison de {len(results)} provider(s) complétée")
-                
-                # Tableau comparatif
-                comparison_data = []
-                for provider, result in results.items():
-                    gen = result.get("generation", {})
-                    analysis = result.get("analysis", {})
-                    high, med, low, score = calculate_metrics(analysis.get("scanners", {}))
-                    
-                    comparison_data.append({
-                        "Provider": provider.upper(),
-                        "Modèle": gen.get("model", "N/A"),
-                        "Tokens": gen.get("tokens_used", 0),
-                        "Coût ($)": f"{gen.get('cost_usd', 0):.4f}",
-                        "HIGH": high,
-                        "MEDIUM": med,
-                        "LOW": low,
-                        "Risk Score": score,
-                    })
-                
-                df = pd.DataFrame(comparison_data)
-                st.dataframe(df, use_container_width=True)
-                
-                # Graphique comparatif
-                if HAS_MATPLOTLIB:
-                    fig, ax = plt.subplots(figsize=(10, 5))
-                    providers_names = [r["Provider"] for r in comparison_data]
-                    risk_scores = [r["Risk Score"] for r in comparison_data]
-                    
-                    ax.bar(providers_names, risk_scores, color=['#667eea', '#764ba2', '#f093fb'][:len(providers_names)])
-                    ax.set_xlabel("Provider")
-                    ax.set_ylabel("Risk Score")
-                    ax.set_title("Comparaison des Risk Scores par Provider")
-                    st.pyplot(fig)
-            else:
-                st.error("Aucun provider n'a réussi à générer du code")
-
 # TAB 5: DASHBOARD
 # ============================================
-with tab_dash:
+if active_tab == "dash":
     st.header("📊 Dashboard des Analyses")
     
     # Récupérer le dernier résultat
@@ -953,81 +1220,191 @@ with tab_dash:
 # ============================================
 # TAB 6: HISTORIQUE
 # ============================================
-with tab_hist:
-    st.header("📚 Historique des Analyses")
-    
-    # Chercher les rapports sauvegardés
-    reports_dir = Path("analyses")
-    if reports_dir.exists():
+if active_tab == "hist":
+    st.header("Historique des Analyses")
+    st.caption("Affichage hierarchique: Date > Type > Severite > Rapport")
+
+    # Chercher les rapports sauvegardes
+    repo_root = Path(__file__).resolve().parents[1]
+    reports_env = os.environ.get("REPORTS_DIR", "analyses")
+    reports_dir = Path(reports_env)
+    if not reports_dir.is_absolute():
+        reports_dir = repo_root / reports_dir
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        st.error(f"Erreur creation repertoire rapports: {exc}")
+        reports_dir = None
+
+    if reports_dir and reports_dir.exists():
         report_files = list(reports_dir.glob("report_*.json"))
         if report_files:
-            st.info(f"📁 {len(report_files)} rapport(s) trouvé(s) dans `analyses/`")
-            
-            # Sélectionner un rapport
-            report_options = {f.name: f for f in sorted(report_files, key=lambda x: x.stat().st_mtime, reverse=True)}
-            selected_report = st.selectbox(
-                "Sélectionner un rapport",
-                options=list(report_options.keys()),
-                index=0 if report_options else None
-            )
-            
-            if selected_report:
-                report_path = report_options[selected_report]
+            st.info(f"{len(report_files)} rapport(s) trouve(s) dans {reports_dir}")
+
+            report_entries = []
+            for report_path in report_files:
                 try:
-                    with open(report_path, 'r', encoding='utf-8') as f:
+                    with open(report_path, "r", encoding="utf-8") as f:
                         report_data = json.load(f)
-                    
-                    st.subheader(f"📄 Rapport: {selected_report}")
-                    
-                    # Métadonnées
-                    metadata = report_data.get("metadata", {})
-                    if metadata:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write("**Source:**", metadata.get("source", "N/A"))
-                            st.write("**Langage:**", metadata.get("language", "N/A"))
-                        with col2:
-                            st.write("**Type:**", metadata.get("type", "N/A"))
-                            st.write("**Date:**", metadata.get("timestamp", "N/A"))
-                    
-                    # Résumé
-                    summary = report_data.get("summary", {})
-                    if summary:
-                        severity = summary.get("severity", {})
-                        risk_score = summary.get("risk_score", 0)
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("HIGH", severity.get("HIGH", 0))
-                        with col2:
-                            st.metric("MEDIUM", severity.get("MEDIUM", 0))
-                        with col3:
-                            st.metric("LOW", severity.get("LOW", 0))
-                        with col4:
-                            st.metric("Risk Score", risk_score)
-                    
-                    # Export
-                    col_exp1, col_exp2 = st.columns(2)
-                    with col_exp1:
-                        json_str = json.dumps(report_data, indent=2, ensure_ascii=False)
-                        st.download_button(
-                            label="📄 Télécharger JSON",
-                            data=json_str,
-                            file_name=selected_report,
-                            mime="application/json"
-                        )
-                    
-                except Exception as e:
-                    st.error(f"Erreur lors du chargement du rapport: {str(e)}")
+                except Exception:
+                    continue
+
+                report_dt = _parse_report_datetime(report_data, report_path)
+                report_type = _infer_report_type(report_data, report_path.name)
+                scanners_data = extract_scanners_data(report_data)
+
+                if scanners_data:
+                    high_count, med_count, low_count, risk_score = calculate_metrics(scanners_data)
+                else:
+                    high_count, med_count, low_count, risk_score = 0, 0, 0, 0
+
+                severity_bucket = _severity_bucket(high_count, med_count, low_count)
+
+                report_entries.append({
+                    "path": report_path,
+                    "name": report_path.name,
+                    "data": report_data,
+                    "dt": report_dt,
+                    "date": report_dt.strftime("%Y-%m-%d"),
+                    "time": report_dt.strftime("%H:%M:%S"),
+                    "type": report_type,
+                    "severity": severity_bucket,
+                    "metrics": {
+                        "high": high_count,
+                        "med": med_count,
+                        "low": low_count,
+                        "risk": risk_score,
+                    },
+                    "scanners": scanners_data,
+                })
+
+            if not report_entries:
+                st.info("Aucun rapport lisible pour l'historique.")
+            else:
+                groups = {}
+                for entry in report_entries:
+                    groups.setdefault(entry["date"], {}).setdefault(entry["type"], {}).setdefault(entry["severity"], []).append(entry)
+
+                type_order = ["generation", "code", "github", "unknown"]
+                type_labels = {
+                    "generation": "Generation IA",
+                    "code": "Analyse de Code",
+                    "github": "Analyse GitHub",
+                    "unknown": "Autre",
+                }
+                severity_order = ["HIGH", "MEDIUM", "LOW", "NONE"]
+
+                for date_key in sorted(groups.keys(), reverse=True):
+                    date_total = sum(len(items) for type_group in groups[date_key].values() for items in type_group.values())
+                    with st.expander(f"{date_key} ({date_total})", expanded=False):
+                        for type_key in type_order:
+                            if type_key not in groups[date_key]:
+                                continue
+                            type_group = groups[date_key][type_key]
+                            type_total = sum(len(items) for items in type_group.values())
+                            type_label = type_labels.get(type_key, type_key.title())
+
+                            with st.expander(f"{type_label} ({type_total})", expanded=False):
+                                for sev_key in severity_order:
+                                    if sev_key not in type_group:
+                                        continue
+                                    sev_items = type_group[sev_key]
+                                    with st.expander(f"Severite {sev_key} ({len(sev_items)})", expanded=False):
+                                        for entry in sorted(sev_items, key=lambda e: e["dt"], reverse=True):
+                                            title = f"{entry['time']} - {entry['name']}"
+                                            with st.expander(title, expanded=False):
+                                                st.caption("Analyse deja effectuee. Rapport charge depuis l'historique.")
+                                                st.write("**Date:**", entry["dt"].strftime("%Y-%m-%d %H:%M:%S"))
+                                                st.write("**Fichier:**", entry["name"])
+
+                                                metadata = entry["data"].get("metadata", {})
+                                                if isinstance(metadata, dict) and metadata:
+                                                    st.subheader("Metadonnees")
+                                                    col1, col2 = st.columns(2)
+                                                    with col1:
+                                                        st.write("**Source:**", metadata.get("source", "N/A"))
+                                                        st.write("**Langage:**", metadata.get("language", "N/A"))
+                                                    with col2:
+                                                        st.write("**Type:**", metadata.get("type", "N/A"))
+                                                        st.write("**Timestamp:**", metadata.get("timestamp", "N/A"))
+
+                                                generation = entry["data"].get("generation")
+                                                if isinstance(generation, dict):
+                                                    st.subheader("Generation IA")
+                                                    gen_meta = generation.get("metadata", {}) if isinstance(generation.get("metadata"), dict) else {}
+                                                    gen_desc = gen_meta.get("description")
+                                                    gen_lang = gen_meta.get("language") or entry["data"].get("analysis", {}).get("language") or entry["data"].get("language")
+
+                                                    col1, col2, col3, col4 = st.columns(4)
+                                                    with col1:
+                                                        st.metric("Provider", generation.get("provider", "N/A"))
+                                                    with col2:
+                                                        st.metric("Modele", generation.get("model", "N/A"))
+                                                    with col3:
+                                                        st.metric("Tokens", generation.get("tokens_used", 0))
+                                                    with col4:
+                                                        cost = generation.get("cost_usd", 0) or 0
+                                                        st.metric("Cout", f"${cost:.4f}" if cost else "Gratuit")
+
+                                                    if gen_desc:
+                                                        st.write("**Description:**", gen_desc)
+                                                    if generation.get("timestamp"):
+                                                        st.write("**Date generation:**", generation.get("timestamp"))
+
+                                                    with st.expander("Code genere"):
+                                                        st.code(generation.get("code", ""), language=gen_lang or "python")
+
+                                                scanners_data = entry["scanners"]
+                                                if scanners_data:
+                                                    st.subheader("Resume securite")
+                                                    col1, col2, col3, col4 = st.columns(4)
+                                                    with col1:
+                                                        st.metric("HIGH", entry["metrics"]["high"])
+                                                    with col2:
+                                                        st.metric("MEDIUM", entry["metrics"]["med"])
+                                                    with col3:
+                                                        st.metric("LOW", entry["metrics"]["low"])
+                                                    with col4:
+                                                        st.metric("Risk Score", entry["metrics"]["risk"])
+
+                                                    if HAS_MATPLOTLIB:
+                                                        fig, ax = plt.subplots(figsize=(6, 3))
+                                                        ax.bar(["HIGH", "MEDIUM", "LOW"], [entry["metrics"]["high"], entry["metrics"]["med"], entry["metrics"]["low"]], color=["#dc3545", "#ffc107", "#28a745"])
+                                                        ax.set_xlabel("Severite")
+                                                        ax.set_ylabel("Nombre")
+                                                        ax.set_title("Distribution des severites")
+                                                        st.pyplot(fig)
+
+                                                    st.subheader("Findings")
+                                                    findings_list = build_findings_list(scanners_data)
+                                                    if findings_list:
+                                                        df = pd.DataFrame(findings_list)
+                                                        st.dataframe(df, use_container_width=True, height=350)
+                                                    else:
+                                                        st.info("Aucun finding dans ce rapport.")
+                                                else:
+                                                    st.info("Aucun resultat de scanner dans ce rapport.")
+
+                                                json_str = json.dumps(entry["data"], indent=2, ensure_ascii=False)
+                                                st.download_button(
+                                                    label="Telecharger JSON",
+                                                    data=json_str,
+                                                    file_name=entry["name"],
+                                                    mime="application/json",
+                                                    key=f"dl_{entry['name']}"
+                                                )
+
+                                                with st.expander("Rapport brut"):
+                                                    st.json(entry["data"])
         else:
-            st.info("📭 Aucun rapport trouvé. Les analyses seront sauvegardées ici si `SAVE_REPORTS=1` est configuré.")
+            st.info("Aucun rapport trouve. Demarrez l'API avec SAVE_REPORTS=1 pour sauvegarder les analyses.")
     else:
-        st.info("📁 Le répertoire `analyses/` n'existe pas encore.")
+        st.info("Repertoire de rapports indisponible.")
 
 # ============================================
 # TAB 7: AIDE
 # ============================================
-with tab_help:
+if active_tab == "help":
     st.header("⚙️ Aide et Documentation")
     
     st.subheader("📖 Guide d'utilisation")
@@ -1041,9 +1418,8 @@ with tab_help:
     
     ### 🐙 Analyse GitHub
     1. Entrez l'URL complète du dépôt GitHub
-    2. Sélectionnez les scanners
-    3. (Optionnel) Ajoutez un token GitHub pour les dépôts privés
-    4. Cliquez sur "Analyser"
+    2. Sélectionnez les scanners (dans la sidebar)
+    3. Cliquez sur "Analyser"
     
     ### 📊 Dashboard
     Visualisez les statistiques de votre dernière analyse avec des graphiques et métriques.
@@ -1057,7 +1433,6 @@ with tab_help:
     st.markdown("""
     - **URL de l'API** : Par défaut `http://localhost:8000`
     - **API Key** : Optionnel, si l'API requiert une authentification
-    - **Token GitHub** : Pour analyser des dépôts privés
     """)
     
     st.subheader("📡 Endpoints API")

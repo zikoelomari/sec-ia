@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
 import os
@@ -9,9 +10,17 @@ import time
 import tempfile
 import zipfile
 import shutil
+from datetime import datetime
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Literal, Optional, Tuple, List
+
+# Charger les variables d'environnement depuis .env si disponible
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv non installé, continuer sans
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -73,9 +82,7 @@ os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 default_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:8501",  # Streamlit
     "http://localhost:8502",  # Streamlit (port unifié)
-    "http://127.0.0.1:8501",
     "http://127.0.0.1:8502",
 ]
 allowed_origins = [
@@ -98,11 +105,29 @@ if HAS_STATIC_FILES and static_dir.exists():
     
     @app.get("/", response_class=FileResponse)
     async def serve_landing_page():
-        """Sert la landing page HTML."""
+        """Sert la landing page HTML en priorité."""
         index_path = static_dir / "index.html"
+        LOG.info(f"Serving landing page from: {index_path}")
+        LOG.info(f"File exists: {index_path.exists()}")
+        
         if index_path.exists():
-            return FileResponse(str(index_path))
-        return {"message": "AI Code Security Guardrail API fonctionne"}
+            return FileResponse(
+                str(index_path),
+                media_type="text/html",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0"
+                }
+            )
+        LOG.warning("Landing page not found, returning API info")
+        return {
+            "message": "AI Code Security Guardrail API fonctionne",
+            "landing_page": "Landing page non disponible",
+            "docs": "/docs",
+            "api_info": "/api",
+            "streamlit": "http://localhost:8502"
+        }
 else:
     @app.get("/")
     async def root():
@@ -111,7 +136,7 @@ else:
             "message": "AI Code Security Guardrail API fonctionne",
             "docs": "/docs",
             "api_info": "/api",
-            "frontend": "Utilisez l'interface Streamlit unifiée sur http://localhost:8501"
+            "frontend": "Utilisez l'interface Streamlit unifiée sur http://localhost:8502"
         }
 
 
@@ -225,6 +250,48 @@ def maybe_persist_report(kind: str, payload: dict) -> None:
         LOG.warning("Unable to persist report: %s", exc)
 
 
+def _build_request_hash(payload: dict) -> str:
+    """Build a stable hash for request metadata."""
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _utc_timestamp() -> str:
+    """Return a compact UTC timestamp for report metadata."""
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _normalize_github_url(raw_url: str) -> str:
+    """Normalize GitHub URLs for stable request hashing."""
+    from urllib.parse import urlparse
+
+    trimmed = (raw_url or "").strip()
+    if not trimmed:
+        return ""
+
+    parsed = urlparse(trimmed)
+    if not parsed.netloc:
+        parsed = urlparse(f"https://{trimmed}")
+
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return trimmed
+
+    owner = parts[0]
+    repo = parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    branch = None
+    if len(parts) >= 4 and parts[2] == "tree":
+        branch = parts[3]
+
+    base = f"https://github.com/{owner}/{repo}"
+    if branch:
+        return f"{base}/tree/{branch}"
+    return base
+
+
 def parse_github_url(url: str) -> Tuple[str, str, Optional[str]]:
     from urllib.parse import urlparse
 
@@ -233,12 +300,15 @@ def parse_github_url(url: str) -> Tuple[str, str, Optional[str]]:
     if len(parts) < 2:
         raise HTTPException(status_code=400, detail="URL GitHub invalide.")
     owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
     branch = parts[3] if len(parts) >= 4 and parts[2] == "tree" else None
     return owner, repo, branch
 
 
 def download_repo_zip(owner: str, repo: str, branch: str, headers: dict) -> Path:
     zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
+    fallback_url = f"https://codeload.github.com/{owner}/{repo}/zip/{branch}"
 
     # Limits: maximum download size (bytes) and maximum total extracted size
     MAX_ZIP_BYTES = int(os.environ.get("MAX_REPO_ZIP_BYTES", str(50 * 1024 * 1024)))
@@ -247,7 +317,10 @@ def download_repo_zip(owner: str, repo: str, branch: str, headers: dict) -> Path
     # Stream the response to avoid loading large archives into memory
     resp = requests.get(zip_url, headers=headers, timeout=60, stream=True)
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Dépôt ou branche introuvable.")
+        fallback_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+        resp = requests.get(fallback_url, headers=fallback_headers, timeout=60, stream=True)
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Dépôt ou branche introuvable.")
     if resp.status_code == 403:
         raise HTTPException(status_code=403, detail="Accès refusé (token manquant ou rate-limit).")
     if resp.status_code >= 400:
@@ -442,6 +515,16 @@ async def analyze(
 ) -> dict:
     # Query param takes precedence over body
     sel = _normalize_and_validate_scanners(request.scanners, scanners)
+    requested_scanners = sorted(sel) if sel else []
+    request_meta = {
+        "type": "code",
+        "mode": "full",
+        "language": request.language,
+        "scanners": requested_scanners,
+        "code_sha256": hashlib.sha256(request.code.encode("utf-8")).hexdigest(),
+        "code_len": len(request.code),
+    }
+    request_hash = _build_request_hash(request_meta)
 
     # pick file suffix based on language for better semgrep/eslint support
     suffix_map = {
@@ -461,7 +544,16 @@ async def analyze(
         # also run the in-memory detector for faster snippet feedback
         gemini = detect_code_string(request.code)
         scans["gemini_detector_snippet"] = gemini
-        response = {"language": request.language, "scanners": scans}
+        response = {
+            "language": request.language,
+            "scanners": scans,
+            "metadata": {
+                "type": "snippet",
+                "timestamp": _utc_timestamp(),
+                "request": request_meta,
+                "request_hash": request_hash,
+            },
+        }
         maybe_persist_report("snippet", response)
         return response
 
@@ -478,7 +570,27 @@ async def analyze_fast(request: AnalyzeRequest, api_key: str = Depends(get_api_k
     LOG.info("Analyze-fast snippet triggered")
     bandit_result = analyze_python_code_with_bandit(request.code)
     gemini = detect_code_string(request.code)
-    return {"language": "python", "scanners": {"bandit": bandit_result, "gemini_detector": gemini}}
+    request_meta = {
+        "type": "code",
+        "mode": "fast",
+        "language": request.language,
+        "scanners": ["bandit", "gemini_detector"],
+        "code_sha256": hashlib.sha256(request.code.encode("utf-8")).hexdigest(),
+        "code_len": len(request.code),
+    }
+    request_hash = _build_request_hash(request_meta)
+    response = {
+        "language": "python",
+        "scanners": {"bandit": bandit_result, "gemini_detector": gemini},
+        "metadata": {
+            "type": "snippet_fast",
+            "timestamp": _utc_timestamp(),
+            "request": request_meta,
+            "request_hash": request_hash,
+        },
+    }
+    maybe_persist_report("snippet_fast", response)
+    return response
 
 
 @app.post("/analyze-github")
@@ -504,10 +616,19 @@ async def analyze_github(
         except Exception:
             branch = "main"
 
+    sel = _normalize_and_validate_scanners(req.scanners, scanners)
+    requested_scanners = sorted(sel) if sel else []
+    normalized_url = _normalize_github_url(req.url)
+    request_meta = {
+        "type": "github",
+        "url": normalized_url,
+        "scanners": requested_scanners,
+    }
+    request_hash = _build_request_hash(request_meta)
+
     LOG.info("Analyze GitHub repo=%s/%s branch=%s scanners=%s", owner, repo, branch, req.scanners or scanners)
     repo_path = download_repo_zip(owner, repo, branch, headers)
     try:
-        sel = _normalize_and_validate_scanners(req.scanners, scanners)
         scans = run_all_scans_on_path(repo_path, scanners=sel, language=None)
     finally:
         try:
@@ -515,7 +636,17 @@ async def analyze_github(
         except Exception:
             pass
 
-    response = {"language": "python", "repo": f"{owner}/{repo}@{branch}", "scanners": scans}
+    response = {
+        "language": "python",
+        "repo": f"{owner}/{repo}@{branch}",
+        "scanners": scans,
+        "metadata": {
+            "type": "repo",
+            "timestamp": _utc_timestamp(),
+            "request": request_meta,
+            "request_hash": request_hash,
+        },
+    }
     maybe_persist_report("repo", response)
     return response
 
@@ -558,6 +689,20 @@ async def generate_and_analyze_endpoint(
         )
     
     LOG.info(f"Generate+Analyze: {request.description} ({request.language}, {request.provider})")
+    requested_scanners = sorted(
+        {s.strip().lower() for s in (request.scanners or []) if isinstance(s, str) and s.strip()}
+    )
+    request_meta = {
+        "type": "generation",
+        "description": request.description,
+        "language": request.language,
+        "provider": request.provider,
+        "model": request.model,
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "scanners": requested_scanners,
+    }
+    request_hash = _build_request_hash(request_meta)
     
     # Étape 1 : Génération du code
     try:
@@ -622,7 +767,7 @@ async def generate_and_analyze_endpoint(
             scans["gemini_detector"] = detector_result
             timings["gemini_detector"] = time.time() - start
         
-        return {
+        response_payload = {
             "generation": {
                 "code": code,
                 "model": gen_result["model"],
@@ -637,7 +782,16 @@ async def generate_and_analyze_endpoint(
                 "scanners": scans,
                 "timings": timings,
             },
+            "metadata": {
+                "type": "generation",
+                "timestamp": gen_result.get("timestamp") or _utc_timestamp(),
+                "request": request_meta,
+                "request_hash": request_hash,
+                "effective_scanners": sorted(sel),
+            },
         }
+        maybe_persist_report("generation", response_payload)
+        return response_payload
     
     finally:
         # Cleanup
