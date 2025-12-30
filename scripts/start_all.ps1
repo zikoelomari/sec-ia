@@ -17,9 +17,12 @@ Write-Host "`n[1/2] Demarrage Backend API..." -ForegroundColor Yellow
 $backendScript = @"
 cd '$projectRoot'
 & '.\.venv\Scripts\Activate.ps1'
+`$env:SAVE_REPORTS = '1'
+`$env:REPORTS_DIR = 'analyses'
 Write-Host 'Backend API demarre sur http://localhost:8000' -ForegroundColor Green
 Write-Host 'API accessible sur: http://localhost:8000/api' -ForegroundColor Cyan
 Write-Host 'Documentation API: http://localhost:8000/docs' -ForegroundColor Cyan
+Write-Host '[ACTIF] Sauvegarde automatique des rapports dans analyses/' -ForegroundColor Green
 python -m uvicorn backend.main:app --reload --port 8000
 "@
 

@@ -6,6 +6,27 @@ Outil de démonstration pour analyser les risques liés au code généré par IA
 
 ---
 
+## 🚀 Démarrage Rapide (Start Here!)
+
+```powershell
+# 1. Activer l'environnement virtuel
+.\.venv\Scripts\Activate.ps1
+
+# 2. Démarrer tous les services avec historique activé
+powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
+```
+
+**Services démarrés** :
+- 🌐 **Backend API** : http://localhost:8000
+- 📊 **Interface Streamlit** : http://localhost:8502
+- 💾 **Historique** : Sauvegarde automatique activée dans `analyses/`
+
+> **📝 Note importante** : Le script active automatiquement `SAVE_REPORTS=1` pour que toutes vos analyses soient sauvegardées dans l'historique et que le système détecte les analyses déjà effectuées.
+
+[→ Guide détaillé de démarrage](#démarrage-rapide-complet)
+
+---
+
 ## Table des matières
 
 1. [Fonctionnalités clés](#fonctionnalités-clés)
@@ -1269,12 +1290,41 @@ curl http://localhost:8000/api
 
 ## Démarrage rapide complet
 
+### 🚀 Démarrage du projet (Méthode Recommandée)
+
+**IMPORTANT** : Le script de démarrage active automatiquement la sauvegarde des rapports dans l'historique.
+
+```powershell
+# Dans votre terminal principal
+cd "C:\Users\zakaria elaou\Desktop\pfa\sec-ia"
+.\.venv\Scripts\Activate.ps1
+
+# Lancer tous les services avec historique activé
+powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
+```
+
+**Ce que fait le script** :
+- ✅ Active `SAVE_REPORTS=1` (sauvegarde automatique)
+- ✅ Crée le dossier `analyses/` pour les rapports
+- ✅ Démarre le Backend API sur http://localhost:8000
+- ✅ Démarre Streamlit sur http://localhost:8502
+- ✅ Affiche un message de confirmation : `[ACTIF] Sauvegarde automatique des rapports`
+
+**Après le démarrage** :
+1. Ouvrir http://localhost:8502 dans votre navigateur
+2. Effectuer une analyse (Code, GitHub, ou Génération IA)
+3. Vérifier que le rapport est sauvegardé : `dir analyses\`
+4. Refaire la même analyse → Message : "Analyse déjà effectuée"
+5. Consulter l'historique dans l'onglet **"Historique"**
+
+---
+
 ### 1. Compiler tout le projet
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/compile_all.ps1
 ```
 
-### 2. Démarrer tous les services
+### 2. Démarrer tous les services (Méthode Alternative)
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/start_all.ps1
 ```
@@ -1282,6 +1332,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start_all.ps1
 Cela démarre :
 - **Backend API** : http://localhost:8000
 - **Streamlit Unifié** : http://localhost:8502
+- **Historique** : Activé automatiquement (analyses/)
 
 ### 3. Tester un dépôt GitHub
 ```powershell
